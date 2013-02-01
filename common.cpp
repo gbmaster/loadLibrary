@@ -23,7 +23,7 @@ unsigned int hash_uppercaseW(const wchar_t* wstring)
 
 	WideCharToMultiByte(CP_ACP, 0, wstring, -1, string, wcslen(wstring) + 1, NULL, NULL);
 	hash = hash_uppercase(string);
-	
+
 	delete[] string;
 
 	return hash;

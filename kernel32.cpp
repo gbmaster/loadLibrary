@@ -3,6 +3,14 @@
 #include "kernel32.hpp"
 #include "common.h"
 
+/*
+ * LoadLibrary migration PHASE:
+ *  1 - this implementation is used to import all the DLLs on which the library depend
+ *  2 - the import table of the DLLs is modified to use my version of LoadLibrary, FreeLibrary, ecc ...
+ */
+
+#define PHASE 2
+
 kernel32* kernel32::instance_ptr = NULL;
 
 /**
@@ -11,10 +19,12 @@ kernel32* kernel32::instance_ptr = NULL;
   */
 HMODULE WINAPI _LoadLibraryExA(LPCSTR lpFileName, HANDLE hFile, DWORD dwFlags)
 {
-	if(!(dwFlags & LOAD_WITH_ALTERED_SEARCH_PATH))
-		return kernel32::get_instance()->LoadLibraryEx(lpFileName, hFile, dwFlags);
-	else
-		return NULL;
+	wchar_t *wstring = new wchar_t[2 * lstrlenA(lpFileName) + 1];
+	MultiByteToWideChar(CP_ACP, 0, lpFileName, lstrlenA(lpFileName) + 1, wstring, lstrlenA(lpFileName) + 1);
+	HMODULE hMod = kernel32::get_instance()->LoadLibraryExW(wstring, hFile, dwFlags);
+	delete [] wstring;
+
+	return hMod;
 }
 
 /**
@@ -33,14 +43,10 @@ HMODULE WINAPI _LoadLibraryA(LPCSTR lpFileName)
   */
 HMODULE WINAPI _LoadLibraryExW(LPCTSTR lpFileName, HANDLE hFile, DWORD dwFlags)
 {
- 	char *string = new char[wcslen(lpFileName) + 1];
-
-	WideCharToMultiByte(CP_ACP, 0, lpFileName, -1, string, wcslen(lpFileName) + 1, NULL, NULL);
-	HMODULE hModule = _LoadLibraryExA(string, hFile, dwFlags);
-
-	delete[] string;
-
-	return hModule;
+	if(!(dwFlags & LOAD_WITH_ALTERED_SEARCH_PATH))
+		return kernel32::get_instance()->LoadLibraryExW(lpFileName, hFile, dwFlags);
+	else
+		return NULL;
 }
 
 /**
@@ -82,7 +88,7 @@ BOOL WINAPI _FreeLibrary(HMODULE hModule)
 }
 
 /**
-  * _Constructor
+  * Constructor
   * it just loads the needed functions dinamically and initializes the critical sections
   */
 kernel32::kernel32()
@@ -90,25 +96,28 @@ kernel32::kernel32()
 	// Our private loader, huhuhu
 	HMODULE hKernel32 = GetModuleHandle(KERNEL32);
 
+	MultiByteToWideChar = (_MULTIBYTETOWIDECHAR)GetProcAddress(hKernel32, MULTIBYTETOWIDECHAR, 0);
+	WideCharToMultiByte = (_WIDECHARTOMULTIBYTE)GetProcAddress(hKernel32, WIDECHARTOMULTIBYTE, 0);
+
 	CloseHandle = (_CLOSEHANDLE)GetProcAddress(hKernel32, CLOSEHANDLE, 0);
-	CreateFile = (_CREATEFILEA)GetProcAddress(hKernel32, CREATEFILEA, 0);
+	CreateFile = (_CREATEFILEW)GetProcAddress(hKernel32, CREATEFILEW, 0);
 	CreateFileMapping = (_CREATEFILEMAPPINGA)GetProcAddress(hKernel32, CREATEFILEMAPPINGA, 0);
 	DeleteCriticalSection = (_DELETECRITICALSECTION)GetProcAddress(hKernel32, DELETECRITICALSECTION, 0);
 	EnterCriticalSection = (_ENTERCRITICALSECTION)GetProcAddress(hKernel32, ENTERCRITICALSECTION, 0);
-	GetCurrentDirectory = (_GETCURRENTDIRECTORYA)GetProcAddress(hKernel32, GETCURRENTDIRECTORYA, 0);
-	GetFullPathName = (_GETFULLPATHNAMEA)GetProcAddress(hKernel32, GETFULLPATHNAMEA, 0);
-	GetSystemDirectory = (_GETSYSTEMDIRECTORYA)GetProcAddress(hKernel32, GETSYSTEMDIRECTORYA, 0);
+	GetCurrentDirectory = (_GETCURRENTDIRECTORYW)GetProcAddress(hKernel32, GETCURRENTDIRECTORYW, 0);
+	GetFullPathName = (_GETFULLPATHNAMEW)GetProcAddress(hKernel32, GETFULLPATHNAMEA, 0);
+	GetSystemDirectory = (_GETSYSTEMDIRECTORYW)GetProcAddress(hKernel32, GETSYSTEMDIRECTORYW, 0);
 	InitializeCriticalSection = (_INITIALIZECRITICALSECTION)GetProcAddress(hKernel32, INITIALIZECRITICALSECTION, 0);
 	LeaveCriticalSection = (_LEAVECRITICALSECTION)GetProcAddress(hKernel32, LEAVECRITICALSECTION, 0);
 	MapViewOfFile = (_MAPVIEWOFFILE)GetProcAddress(hKernel32, MAPVIEWOFFILE, 0);
 	MapViewOfFileEx = (_MAPVIEWOFFILEEX)GetProcAddress(hKernel32, MAPVIEWOFFILEEX, 0);
-	WideCharToMultiByte = (_WIDECHARTOMULTIBYTE)GetProcAddress(hKernel32, WIDECHARTOMULTIBYTE, 0);
 	UnmapViewOfFile = (_UNMAPVIEWOFFILE)GetProcAddress(hKernel32, UNMAPVIEWOFFILE, 0);
 	VirtualAlloc = (_VIRTUALALLOC)GetProcAddress(hKernel32, VIRTUALALLOC, 0);
 	VirtualFree = (_VIRTUALFREE)GetProcAddress(hKernel32, VIRTUALFREE, 0);
 	VirtualProtect = (_VIRTUALPROTECT)GetProcAddress(hKernel32, VIRTUALPROTECT, 0);
 
 	OrigFreeLibrary = (_FREELIBRARY)GetProcAddress(hKernel32, FREELIBRARY, 0);
+	OrigLoadLibraryEx = (_LOADLIBRARYEXW)GetProcAddress(hKernel32, LOADLIBRARYEXW, 0);
 
 	InitializeCriticalSection(&libCritical);
 }
@@ -270,23 +279,23 @@ HMODULE kernel32::GetModuleHandle(unsigned int hash)
   * GetModuleHandleByString
   * Internal function: like GetModuleHandle, but it uses a string instead of a hash
   */
-HMODULE kernel32::GetModuleHandleByString(LPCSTR lpModuleName, BOOL& byWindows)
+HMODULE kernel32::GetModuleHandleByString(LPCTSTR lpModuleName, BOOL& byWindows)
 {
 	HMODULE handle;
 
-	if((handle = GetModuleHandle(hash_uppercase(lpModuleName), byWindows)) == NULL)
+	if((handle = GetModuleHandle(hash_uppercaseW(lpModuleName), byWindows)) == NULL)
 	{
-		char curDir[MAX_PATH];
+		wchar_t curDir[MAX_PATH];
 		GetCurrentDirectory(MAX_PATH - 1, curDir);
-		lstrcatA(curDir, "\\");
-		lstrcpynA(curDir + lstrlenA(curDir), lpModuleName, MAX_PATH - lstrlenA(lpModuleName));
-		if((handle = GetModuleHandle(hash_uppercase(curDir), byWindows)) == NULL)
+		lstrcat(curDir, L"\\");
+		lstrcpyn(curDir + lstrlen(curDir), lpModuleName, MAX_PATH - lstrlen(lpModuleName));
+		if((handle = GetModuleHandle(hash_uppercaseW(curDir), byWindows)) == NULL)
 		{
-			char sysDir[MAX_PATH];
+			wchar_t sysDir[MAX_PATH];
 			GetSystemDirectory(sysDir, MAX_PATH - 1);
-			lstrcatA(sysDir, "\\");
-			lstrcpynA(sysDir + lstrlenA(sysDir), lpModuleName, MAX_PATH - lstrlenA(lpModuleName));
-			handle = GetModuleHandle(hash_uppercase(sysDir), byWindows);
+			lstrcat(sysDir, L"\\");
+			lstrcpyn(sysDir + lstrlen(sysDir), lpModuleName, MAX_PATH - lstrlen(lpModuleName));
+			handle = GetModuleHandle(hash_uppercaseW(sysDir), byWindows);
 		}
 	}
 
@@ -295,12 +304,42 @@ HMODULE kernel32::GetModuleHandleByString(LPCSTR lpModuleName, BOOL& byWindows)
 
 /**
   * GetModuleHandleByString
-  * Public function that hides the byWindows parameter. 
+  * Public function that hides the byWindows parameter.
+  */
+HMODULE kernel32::GetModuleHandleByString(LPCTSTR lpModuleName)
+{
+	BOOL byWindows;
+	return GetModuleHandleByString(lpModuleName, byWindows);
+}
+
+/**
+  * GetModuleHandleByString
+  * Internal function: like GetModuleHandle, but it uses a string instead of a hash
+  */
+HMODULE kernel32::GetModuleHandleByString(LPCSTR lpModuleName, BOOL& byWindows)
+{
+	wchar_t *wstring = new wchar_t[2 * lstrlenA(lpModuleName) + 1];
+	MultiByteToWideChar(CP_ACP, 0, lpModuleName, lstrlenA(lpModuleName) + 1, wstring, lstrlenA(lpModuleName) + 1);
+	HMODULE hModule = GetModuleHandleByString(wstring);
+	delete [] wstring;
+
+	return hModule;
+}
+
+/**
+  * GetModuleHandleByString
+  * Public function that hides the byWindows parameter.
   */
 HMODULE kernel32::GetModuleHandleByString(LPCSTR lpModuleName)
 {
 	BOOL byWindows;
-	return GetModuleHandleByString(lpModuleName, byWindows);
+
+	wchar_t *wstring = new wchar_t[2 * lstrlenA(lpModuleName) + 1];
+	MultiByteToWideChar(CP_ACP, 0, lpModuleName, lstrlenA(lpModuleName) + 1, wstring, lstrlenA(lpModuleName) + 1);
+	HMODULE hModule = GetModuleHandleByString(wstring, byWindows);
+	delete [] wstring;
+
+	return hModule;
 }
 
 /**
@@ -377,8 +416,11 @@ FARPROC kernel32::GetProcAddress(HMODULE hModule, unsigned int hash, unsigned in
 		HMODULE hFwdModule = GetModuleHandleByString(dllName);
 		if(hFwdModule == NULL)
 		{
-			hFwdModule = LoadLibrary(dllName);
-					
+#if PHASE > 0
+			hFwdModule = LoadLibraryA(dllName);
+#else
+			hFwdModule = ::LoadLibraryA(dllName);
+#endif
 			if(hFwdModule == NULL)
 				return NULL;
 		}
@@ -400,15 +442,15 @@ FARPROC kernel32::GetProcAddress(HMODULE hModule, unsigned int hash, unsigned in
   * The core of the library. It loads the specified library.
   * Just some of the flags are implemented, i.e. LOAD_LIBRARY_AS_DATAFILE and DONT_RESOLVE_DLL_REFERENCES.
   */
-HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dwFlags)
+HMODULE kernel32::LoadLibraryExWrapped(LPCTSTR lpFileName, HANDLE hFile, DWORD dwFlags)
 {
-	char lpFilePath[MAX_PATH], sysDir[MAX_PATH], curDir[MAX_PATH];
+	wchar_t lpFilePath[MAX_PATH], sysDir[MAX_PATH], curDir[MAX_PATH];
 	GetSystemDirectory(sysDir, MAX_PATH - 1);
 	GetCurrentDirectory(MAX_PATH - 1, curDir);
-	lstrcatA(curDir, "\\");
-	lstrcpynA(curDir + lstrlenA(curDir), lpFileName, MAX_PATH - lstrlenA(lpFileName));
-	lstrcatA(sysDir, "\\");
-	lstrcpynA(sysDir + lstrlenA(sysDir), lpFileName, MAX_PATH - lstrlenA(lpFileName));
+	lstrcat(curDir, L"\\");
+	lstrcpyn(curDir + lstrlen(curDir), lpFileName, MAX_PATH - lstrlen(lpFileName));
+	lstrcat(sysDir, L"\\");
+	lstrcpyn(sysDir + lstrlen(sysDir), lpFileName, MAX_PATH - lstrlen(lpFileName));
 
 	// Already loaded ?
 	BOOL byWindows;
@@ -422,25 +464,38 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 			if(module_entryit != libInstancesMap.end() && module_entryit->second->instances != 0xFFFF)
 				module_entryit->second->instances++;
 		}
+		else
+		{
+			// This call is needed to increment by 1 the Windows reference counter
+			OrigLoadLibraryEx(lpFileName, hFile, dwFlags);
+		}
 		return hModule;
 	}
 
 	// Open the library, please
-	HANDLE handle = CreateFile(curDir, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	// Maybe an absolute path?
+	HANDLE handle = CreateFile(lpFileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if(handle == INVALID_HANDLE_VALUE)
 	{
-		// No luck with local path, let's try to search in system32
-		handle = CreateFile(sysDir, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+		// No luck with absolute path, let's try to search it locally
+		handle = CreateFile(curDir, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 		if(handle == INVALID_HANDLE_VALUE)
 		{
-			// No luck at all
-			return NULL;
+			// No luck with local path, let's try to search in system32
+			handle = CreateFile(sysDir, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+			if(handle == INVALID_HANDLE_VALUE)
+			{
+				// No luck at all
+				return NULL;
+			}
+			else
+				lstrcpy(lpFilePath, sysDir);
 		}
 		else
-			lstrcpyA(lpFilePath, sysDir);
+			lstrcpy(lpFilePath, curDir);
 	}
 	else
-		lstrcpyA(lpFilePath, curDir);
+		lstrcpy(lpFilePath, lpFileName);
 
 	// Map the file in memory
 	HANDLE hMapping = CreateFileMapping(handle, NULL, PAGE_READONLY, 0, 0, NULL);
@@ -550,7 +605,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 	MODULES_LIST *entry;
 
 	entry = new MODULES_LIST;
-	entry->hashName = hash_uppercase(lpFilePath);
+	entry->hashName = hash_uppercaseW(lpFilePath);
 	entry->hModule = (HMODULE)baseDll;
 	entry->instances = 1;
 	entry->flags = dwFlags;
@@ -558,16 +613,16 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 	entry->next = NULL;
 
 	// WINDOWS 7 MESS
-	char targetName[MAX_PATH], *filePart, system32Dir[MAX_PATH];
+	wchar_t targetName[MAX_PATH], *filePart, system32Dir[MAX_PATH];
 	GetFullPathName(lpFilePath, MAX_PATH, targetName, &filePart);
 	GetSystemDirectory(system32Dir, MAX_PATH - 1);
-	lstrcpynA(filePart, filePart, 16);
-	lstrcatA(system32Dir, "\\");
-	if(hash_uppercase(filePart) == 0x5DE52DB9)
+	lstrcpyn(filePart, filePart, 16);
+	lstrcat(system32Dir, L"\\");
+	if(hash_uppercaseW(filePart) == 0x5DE52DB9)
 	{
 		filePart[0] = 0;
 		// Is the file in system32 ?
-		if(hash_uppercase(targetName) == hash_uppercase(system32Dir))
+		if(hash_uppercaseW(targetName) == hash_uppercaseW(system32Dir))
 			entry->bMsWinCore = TRUE;
 		else
 			entry->bMsWinCore = FALSE;
@@ -603,7 +658,11 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 					if(hLib == NULL)
 					{
 						// Load the library
-						hLib = LoadLibraryEx((const char *)((PBYTE)baseDll + baseImp->Name), 0, dwFlags);
+#if PHASE > 0
+						hLib = LoadLibraryExA((const char *)((PBYTE)baseDll + baseImp->Name), 0, dwFlags);
+#else
+						hLib = ::LoadLibraryExA((const char *)((PBYTE)baseDll + baseImp->Name), 0, dwFlags);
+#endif
 
 						if(hLib == NULL)
 						{
@@ -653,7 +712,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 						if(((PIMAGE_THUNK_DATA)nameRef)->u1.Ordinal & 0x80000000)
 						{
 							DWORD nOrdinal = (((PIMAGE_THUNK_DATA)nameRef)->u1.Ordinal & 0xFFFF);
-/*
+#if 0
 							if(hash_uppercase((const char *)((PBYTE)baseDll + baseImp->Name)) == KERNEL32)
 							{
 								if(nOrdinal == 241) *symbolRef = (DWORD)_FreeLibrary;
@@ -666,7 +725,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 								else *symbolRef = (DWORD)GetProcAddress(hLib, 0, nOrdinal);
 							}
 							else
-*/
+#endif
 								*symbolRef = (DWORD)GetProcAddress(hLib, 0, nOrdinal);
 						}
 						else
@@ -675,6 +734,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 
 							// remember the user32.dll hell ?
 							unsigned int func_hash = hash_uppercase(funcName);
+#if PHASE > 1
 							if(hash_uppercase((const char *)((PBYTE)baseDll + baseImp->Name)) == KERNEL32)
 							{
 								if(func_hash == FREELIBRARY) *symbolRef = (DWORD)_FreeLibrary;
@@ -687,6 +747,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 								else *symbolRef = (DWORD)GetProcAddress(hLib, func_hash, 0);
 							}
 							else
+#endif
 								*symbolRef = (DWORD)GetProcAddress(hLib, func_hash, 0);
 						}
 					}
@@ -726,7 +787,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 			else if(!protectR && protectW && !protectX) newProtect = PAGE_WRITECOPY;
 			else if(protectR && !protectW && !protectX) newProtect = PAGE_READONLY;
 			else if(protectR && protectW && !protectX) newProtect = PAGE_READWRITE;
-				
+
  			if(pSection->Characteristics & IMAGE_SCN_MEM_NOT_CACHED)
 				newProtect |= PAGE_NOCACHE;
 
@@ -739,6 +800,7 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 			if(pNTHeader->FileHeader.Characteristics & IMAGE_FILE_DLL)
 			{
 				DllEntryProc entryPoint = (DllEntryProc)((PBYTE)baseDll + pNTHeader->OptionalHeader.AddressOfEntryPoint);
+				if(!lstrcmp(filePart, L"chrome.dll")) __asm { int 3 };
  				(*entryPoint)((HINSTANCE)baseDll, DLL_PROCESS_ATTACH, 0);
 			}
 		}
@@ -751,35 +813,49 @@ HMODULE kernel32::LoadLibraryExWrapped(LPCSTR lpFileName, HANDLE hFile, DWORD dw
 }
 
 /**
-  * LoadLibraryWrapped
-  * It loads the specified library. Just a simple wrapper for LoadLibraryEx.
+  * LoadLibraryA
+  * Loads the library.
   */
-HMODULE kernel32::LoadLibraryWrapped(const char *lpFileName)
+HMODULE kernel32::LoadLibraryA(LPCSTR lpFileName)
 {
-	return LoadLibraryEx(lpFileName, 0, 0);
-}
-
-/**
-  * LoadLibraryEx
-  * Wrapping the wrapper: initializes the critical sections and calls LoadLibraryExWrapped
-  */
-HMODULE kernel32::LoadLibraryEx(LPCSTR lpFileName, HANDLE hFile, DWORD dwFlags)
-{
-	EnterCriticalSection(&libCritical);
-	HMODULE hMod = LoadLibraryExWrapped(lpFileName, hFile, dwFlags);
-	LeaveCriticalSection(&libCritical);
+	HMODULE hMod = LoadLibraryExA(lpFileName, 0, 0);
 
 	return hMod;
 }
 
 /**
-  * LoadLibrary
+  * LoadLibraryW
   * Loads the library.
   */
-HMODULE kernel32::LoadLibrary(const char *lpFileName)
+HMODULE kernel32::LoadLibraryW(LPCTSTR lpFileName)
+{
+	HMODULE hMod = LoadLibraryExW(lpFileName, 0, 0);
+
+	return hMod;
+}
+
+/**
+  * LoadLibraryExA
+  * Wrapping the wrapper: initializes the critical sections and calls LoadLibraryExWrapped
+  */
+HMODULE kernel32::LoadLibraryExA(LPCSTR lpFileName, HANDLE hFile, DWORD dwFlags)
+{
+	wchar_t *wstring = new wchar_t[2 * lstrlenA(lpFileName) + 1];
+	MultiByteToWideChar(CP_ACP, 0, lpFileName, lstrlenA(lpFileName) + 1, wstring, lstrlenA(lpFileName) + 1);
+	HMODULE hMod = LoadLibraryExW(wstring, hFile, dwFlags);
+	delete [] wstring;
+
+	return hMod;
+}
+
+/**
+  * LoadLibraryExW
+  * Wrapping the wrapper: initializes the critical sections and calls LoadLibraryExWrapped
+  */
+HMODULE kernel32::LoadLibraryExW(LPCTSTR lpFileName, HANDLE hFile, DWORD dwFlags)
 {
 	EnterCriticalSection(&libCritical);
-	HMODULE hMod = LoadLibraryWrapped(lpFileName);
+	HMODULE hMod = LoadLibraryExWrapped(lpFileName, hFile, dwFlags);
 	LeaveCriticalSection(&libCritical);
 
 	return hMod;
